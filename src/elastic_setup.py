@@ -1,90 +1,87 @@
-# ============================================================
-# elastic_setup.py
-# Αποθηκεύει κείμενα + ευρετήριο στον Elasticsearch
-# και δίνει συναρτήσεις για να τα διαβάζουμε πίσω.
-# ============================================================
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# Elasticsearch: ο client που μιλά με τον server
-# helpers: έχει το bulk (εισαγωγή πολλών documents μαζί)
-# NotFoundError: το σφάλμα όταν ζητάμε κάτι που δεν υπάρχει
 from elasticsearch import Elasticsearch, helpers, NotFoundError
+from src.preprocessing import parse_cf_documents
+from src.inverted_index import InvertedIndex
 
-# --- Ρυθμίσεις: τις αλλάζουμε μόνο εδώ ---
-ES_URL = "http://localhost:9200"   # πού τρέχει ο ES (το container σου)
+# --- Ρυθμίσεις ---
+ES_URL = "http://localhost:9200"
 IDX_DOCS = "cf_docs"               # index με τα κείμενα
 IDX_INVERTED = "cf_inverted"       # index με το ανεστραμμένο ευρετήριο
-IDX_STATS = "cf_stats"             # index με τα N και avgdl
+IDX_STATS = "cf_stats"             # index με N, avgdl, doc_lengths και doc_norms
 
-# Ο client. Εδώ ΔΕΝ γίνεται ακόμα επικοινωνία, μόνο ετοιμάζεται.
 es = Elasticsearch(ES_URL)
 
 
 def recreate_index(name, mappings=None):
-    """Σβήνει το index αν υπάρχει και το φτιάχνει από την αρχή.
-    Έτσι, αν τρέξεις το script 2 φορές, δεν μένουν παλιά δεδομένα."""
-    if es.indices.exists(index=name):      # υπάρχει ήδη;
-        es.indices.delete(index=name)      # ναι -> σβήστο
-    # mappings=None -> ο ES μαντεύει μόνος του τους τύπους των πεδίων
+    """Σβήνει το index αν υπάρχει και το φτιάχνει από την αρχή."""
+    if es.indices.exists(index=name):
+        es.indices.delete(index=name)
     es.indices.create(index=name, mappings=mappings)
 
 
 def store_docs(docs):
-    """Γράφει τα κείμενα. Κάθε dict της λίστας docs = ένα document."""
+    """Γράφει τα κείμενα στον ES. Κάθε dict της λίστας docs = ένα document."""
     recreate_index(IDX_DOCS)
-    # Generator: για κάθε κείμενο d φτιάχνει μια "εντολή" για το bulk
     actions = (
         {
-            "_index": IDX_DOCS,   # σε ποιο index θα γραφτεί
-            "_id": d["rn"],       # το id του document (το RN, το ίδιο με το cfquery)
-            "_source": d,         # το περιεχόμενο: ολόκληρο το dict του κειμένου
+            "_index": IDX_DOCS,
+            "_id": d["doc_id"],   # ΔΙΟΡΘΩΣΗ: το κλειδί από τον parser είναι "doc_id"
+            "_source": d,
         }
         for d in docs
     )
-    helpers.bulk(es, actions)     # τα στέλνει όλα μαζεμένα, πολύ πιο γρήγορα από ένα-ένα
+    helpers.bulk(es, actions)
 
 
-def store_inverted(inverted):
-    """Γράφει το ανεστραμμένο ευρετήριο: ένα document ανά όρο."""
-    # mapping: λέμε στον ES πώς να αποθηκεύσει τα πεδία
+def store_inverted(inv_index: InvertedIndex):
+    """Γράφει το ανεστραμμένο ευρετήριο (ένα document ανά όρο)."""
     recreate_index(IDX_INVERTED, mappings={
         "properties": {
-            "df": {"type": "integer"},            # σε πόσα κείμενα εμφανίζεται ο όρος
-            # enabled=False: αποθήκευσέ το αλλά ΜΗΝ το ευρετηριάσεις
-            # (το ευρετήριο είναι δικό μας, όχι του ES)
+            "df": {"type": "integer"},
             "postings": {"type": "object", "enabled": False},
         }
     })
     actions = (
         {
             "_index": IDX_INVERTED,
-            "_id": term,                          # ο ίδιος ο όρος είναι το id -> lookup με get
+            "_id": term,
             "_source": {
-                "df": len(postings),              # df = πόσα ζεύγη (doc, tf) έχει ο όρος
-                # μετατρέπουμε τα ζεύγη (doc_id, tf) σε dicts, ώστε να είναι JSON
-                "postings": [{"doc_id": d, "tf": tf} for d, tf in postings],
+                "df": data["df"],
+                # ΔΙΟΡΘΩΣΗ: το data["postings"] είναι dict {doc_id: tf}
+                "postings": [{"doc_id": d, "tf": tf} for d, tf in data["postings"].items()],
             },
         }
-        for term, postings in inverted.items()    # για κάθε όρο του ευρετηρίου
+        for term, data in inv_index.index.items()
     )
     helpers.bulk(es, actions)
 
 
-def store_stats(docs):
-    """Γράφει τα καθολικά στατιστικά που χρειάζεται το BM25."""
-    N = len(docs)                                 # συνολικός αριθμός κειμένων
-    avgdl = sum(d["length"] for d in docs) / N    # μέσο μήκος κειμένου
-    recreate_index(IDX_STATS)
-    # ένα μόνο document, με σταθερό id "stats"
-    es.index(index=IDX_STATS, id="stats", document={"N": N, "avgdl": avgdl})
+def store_stats(inv_index: InvertedIndex):
+    """Γράφει τα καθολικά στατιστικά που χρειάζονται BM25 και VSM."""
+    recreate_index(IDX_STATS, mappings={
+        "properties": {
+            "N": {"type": "integer"},
+            "avgdl": {"type": "float"},
+            "doc_lengths": {"type": "object", "enabled": False},
+            "doc_norms": {"type": "object", "enabled": False},
+        }
+    })
+    es.index(index=IDX_STATS, id="stats", document={
+        "N": inv_index.total_docs,
+        "avgdl": inv_index.avg_doc_length,
+        "doc_lengths": inv_index.doc_lengths,   # Απαραίτητο για BM25
+        "doc_norms": inv_index.doc_norms,       # Απαραίτητο για VSM (Cosine Similarity)
+    })
 
 
-def build_all(docs, inverted):
-    """Κάνει τα τρία παραπάνω με τη σειρά."""
+def build_all(docs, inv_index: InvertedIndex):
+    """Εκτελεί όλη την εισαγωγή δεδομένων και ευρετηρίου στον Elasticsearch."""
     store_docs(docs)
-    store_inverted(inverted)
-    store_stats(docs)
-    # refresh: κάνει τα νέα δεδομένα ορατά αμέσως
-    # (αλλιώς ο ES μπορεί να αργήσει ~1 δευτερόλεπτο)
+    store_inverted(inv_index)
+    store_stats(inv_index)
     es.indices.refresh(index="_all")
 
 
@@ -93,24 +90,44 @@ def build_all(docs, inverted):
 # ------------------------------------------------------------
 
 def get_postings(term):
-    """Δίνει (df, [(doc_id, tf), ...]) για έναν όρο.
-    Αν ο όρος δεν υπάρχει στο ευρετήριο, δίνει (0, [])."""
+    """Δίνει (df, [(doc_id, tf), ...]) για έναν όρο."""
     try:
-        # get με _id = όρος: άμεσο lookup, σαν dict
         src = es.get(index=IDX_INVERTED, id=term)["_source"]
     except NotFoundError:
-        return 0, []                              # άγνωστος όρος: όχι σφάλμα, απλά κενό
-    # ξαναγυρνάμε από dicts σε ζεύγη (doc_id, tf)
+        return 0, []
     return src["df"], [(p["doc_id"], p["tf"]) for p in src["postings"]]
 
 
 def get_stats():
-    """Δίνει (N, avgdl)."""
-    src = es.get(index=IDX_STATS, id="stats")["_source"]
-    return src["N"], src["avgdl"]
+    """Δίνει λεξικό με N, avgdl, doc_lengths και doc_norms."""
+    return es.get(index=IDX_STATS, id="stats")["_source"]
 
 
-def get_doc(rn):
-    """Δίνει το dict ενός κειμένου από το RN του."""
-    return es.get(index=IDX_DOCS, id=rn)["_source"]
+def get_doc(doc_id):
+    """Δίνει το dict ενός κειμένου από το doc_id του."""
+    return es.get(index=IDX_DOCS, id=str(doc_id))["_source"]
 
+
+def get_all_docs():
+    """Φέρνει όλα τα αποθηκευμένα κείμενα από τον ES (για τα μοντέλα βιβλιοθηκών & RAG)."""
+    results = helpers.scan(es, index=IDX_DOCS, query={"query": {"match_all": {}}})
+    docs = [hit["_source"] for hit in results]
+    # Ταξινομούμε με βάση το αριθμητικό doc_id για σταθερή σειρά
+    docs.sort(key=lambda d: int(d["doc_id"]))
+    return docs
+
+
+if __name__ == "__main__":
+    print("1. Ανάγνωση εγγράφων από τα τοπικά αρχεία...")
+    docs = parse_cf_documents()
+   
+    print("2. Κατασκευή Custom Inverted Index...")
+    inv_index = InvertedIndex()
+    inv_index.build(docs)
+   
+    print("3. Αποθήκευση συλλογής και ευρετηρίου στην Elasticsearch...")
+    build_all(docs, inv_index)
+   
+    stats = get_stats()
+    all_docs = get_all_docs()
+    print(f"Ολοκληρώθηκε! Αποθηκεύτηκαν {len(all_docs)} έγγραφα (N={stats['N']}, avgdl={stats['avgdl']:.2f}).")
